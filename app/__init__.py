@@ -1,0 +1,1 @@
+"""TableGamesBot application package."""
