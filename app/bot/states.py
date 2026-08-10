@@ -7,3 +7,8 @@ class JoinByCode(StatesGroup):
 
 class AdminInput(StatesGroup):
     waiting_for_text = State()
+
+
+class HatInput(StatesGroup):
+    waiting_for_word = State()
+    waiting_for_emergency_phrase = State()

@@ -9,7 +9,7 @@ description = "Extensible Telegram bot for tabletop games"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-  "aiogram>=3.13,<4",
+  "aiogram>=3.19,<4",
   "aiosqlite>=0.20,<1",
   "SQLAlchemy[asyncio]>=2.0.36,<3",
   "alembic>=1.14,<2",

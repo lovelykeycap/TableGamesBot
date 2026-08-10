@@ -29,7 +29,13 @@ def create_admin_router(
         if message.from_user is None:
             return
         await _ensure_user(rooms, message)
+        await delivery.delete_processed_message(message)
         if not _is_admin(message.from_user.id, admin_ids):
+            return
+        playing_room_id = await rooms.playing_room_for_user(message.from_user.id)
+        if playing_room_id is not None:
+            await state.clear()
+            await delivery.render_room_for_user(playing_room_id, message.from_user.id)
             return
         await state.clear()
         await _render_admin_home(catalog, delivery, message.from_user.id)
@@ -41,6 +47,12 @@ def create_admin_router(
         if not _is_admin(callback.from_user.id, admin_ids):
             await callback.answer("Недостаточно прав.")
             return
+        playing_room_id = await rooms.playing_room_for_user(callback.from_user.id)
+        if playing_room_id is not None:
+            await state.clear()
+            await delivery.render_room_for_user(playing_room_id, callback.from_user.id)
+            await callback.answer("Админка недоступна, пока вы участвуете в партии.")
+            return
         try:
             await _handle_admin_callback(
                 catalog, delivery, callback.from_user.id, callback.data, state
@@ -50,9 +62,15 @@ def create_admin_router(
             return
         await callback.answer()
 
-    @router.message(AdminInput.waiting_for_text, F.text)
+    @router.message(AdminInput.waiting_for_text, F.text, ~F.text.startswith("/"))
     async def receive_admin_text(message: Message, state: FSMContext) -> None:
         if message.from_user is None or not _is_admin(message.from_user.id, admin_ids):
+            return
+        await delivery.delete_processed_message(message)
+        playing_room_id = await rooms.playing_room_for_user(message.from_user.id)
+        if playing_room_id is not None:
+            await state.clear()
+            await delivery.render_room_for_user(playing_room_id, message.from_user.id)
             return
         data = await state.get_data()
         operation = data.get("operation")

@@ -3,7 +3,7 @@ from __future__ import annotations
 from html import escape
 from math import ceil
 
-from aiogram.types import InlineKeyboardMarkup
+from aiogram.types import CopyTextButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from app.bot.callbacks import pack_room_callback
@@ -13,10 +13,6 @@ from app.services.views import MemberView, RoomView
 
 def _name(value: str) -> str:
     return escape(value[:80])
-
-
-def _role_label(role: str | None) -> str:
-    return "🕵️ Шпион" if role == ROLE_SPY else "🙂 Мирный"
 
 
 def _result_label(result: str | None) -> str:
@@ -106,10 +102,12 @@ class RoomRenderer:
         selected_count = sum(theme.is_selected for theme in view.themes)
         link = f"https://t.me/{self._bot_username}?start=join_{view.join_token}"
         lines = [
-            "<b>🕵️ Шпион — лобби</b>",
+            "<b>■ Шпион — лобби</b>",
             f"Код комнаты: <code>{view.join_code}</code>",
-            f"Ссылка для входа: {link}",
-            f"Игроки ({len(active)}/40): {self._members_text(active, reveal_roles=False)}",
+            "",
+            f"Игроки ({len(active)}/40):",
+            *self._member_lines(active),
+            "",
             f"Шпионы: {spy_setting}",
             f"Шпионы знают друг друга: {'да' if settings.get('spies_know_each_other') else 'нет'}",
             f"Темы комнаты: {selected_count} из {len(view.themes)}",
@@ -118,15 +116,28 @@ class RoomRenderer:
         if view.is_host:
             lines.append("\nВы хост комнаты.")
         builder = InlineKeyboardBuilder()
+        builder.button(
+            text="📋 Скопировать код",
+            copy_text=CopyTextButton(text=view.join_code),
+        )
+        builder.button(
+            text="🔗 Скопировать ссылку",
+            copy_text=CopyTextButton(text=link),
+        )
+        builder.adjust(2)
         if view.is_host:
             builder.button(
                 text="🔒 Закрыть вход" if view.is_join_open else "🔓 Открыть вход",
                 callback_data=self._cb(view, "open", "0" if view.is_join_open else "1"),
             )
             builder.button(
-                text="🎲 Случайное число", callback_data=self._cb(view, "mode", "random")
+                text=f"{'✅ ' if mode == 'random' else ''}🎲 Случайное число",
+                callback_data=self._cb(view, "mode", "random"),
             )
-            builder.button(text="🔢 Точное число", callback_data=self._cb(view, "mode", "exact"))
+            builder.button(
+                text=f"{'✅ ' if mode == 'exact' else ''}🔢 Точное число",
+                callback_data=self._cb(view, "mode", "exact"),
+            )
             builder.adjust(1, 2)
             if mode == "exact":
                 count = int(settings.get("spy_count", 1))
@@ -155,20 +166,24 @@ class RoomRenderer:
             return "<b>Ошибка партии</b>", InlineKeyboardBuilder().as_markup()
         builder = InlineKeyboardBuilder()
         if view.status == "finished":
+            spies = tuple(member for member in view.members if member.role == ROLE_SPY)
             lines = [
-                "<b>🕵️ Шпион — партия завершена</b>",
+                "<b>■ Шпион — партия завершена</b>",
                 _result_label(game.result),
                 f"Тема: <b>{escape(game.theme_name)}</b>",
                 f"Локация: <b>{escape(game.location_name)}</b>",
-                f"Роли: {self._members_text(view.members, reveal_roles=True)}",
+                "Шпионы:",
+                *self._member_lines(spies),
             ]
+            builder.button(text="🎮 К играм", callback_data="h:home")
+            builder.adjust(1)
             return "\n".join(lines), builder.as_markup()
 
-        lines = ["<b>🕵️ Шпион — игра идёт</b>"]
+        lines = ["<b>■ Шпион — игра идёт</b>"]
         if view.actor_status != "active":
             lines.append("Вы зритель. Управлять игрой уже нельзя.")
         elif view.actor_role == ROLE_SPY:
-            lines.extend(["Ваша роль: <b>🕵️ Шпион</b>", f"Тема: <b>{escape(game.theme_name)}</b>"])
+            lines.extend(["Ваша роль: <b>■ Шпион</b>", f"Тема: <b>{escape(game.theme_name)}</b>"])
             if game.spies_know_each_other:
                 known = (
                     ", ".join(_name(name) for name in view.known_spy_names) or "других шпионов нет"
@@ -182,7 +197,9 @@ class RoomRenderer:
                     f"Локация: <b>{escape(game.location_name)}</b>",
                 ]
             )
-        lines.append(f"В игре: {self._members_text(view.active_members, reveal_roles=False)}")
+        lines.extend(
+            [f"В игре ({len(view.active_members)}):", *self._member_lines(view.active_members)]
+        )
         if view.vote is not None:
             subject = next(
                 (member for member in view.members if member.id == view.vote.subject_member_id),
@@ -221,7 +238,7 @@ class RoomRenderer:
                 text="🗳 Выдвинуть на голосование", callback_data=self._cb(view, "candidates", "0")
             )
             if view.actor_role == ROLE_SPY:
-                builder.button(text="🕵️ Вскрыться", callback_data=self._cb(view, "reveal"))
+                builder.button(text="■ Вскрыться", callback_data=self._cb(view, "reveal"))
             builder.adjust(1, 1)
         if view.is_host and view.actor_status == "active":
             builder.button(text="⚠️ Аварийно завершить", callback_data=self._cb(view, "cancel"))
@@ -232,24 +249,22 @@ class RoomRenderer:
         return "\n".join(lines), builder.as_markup()
 
     def _render_closed(self, view: RoomView) -> tuple[str, InlineKeyboardMarkup]:
-        return "<b>Комната закрыта.</b>", InlineKeyboardBuilder().as_markup()
+        builder = InlineKeyboardBuilder()
+        builder.button(text="🎮 К играм", callback_data="h:home")
+        return "<b>Комната закрыта.</b>", builder.as_markup()
 
     def _cb(self, view: RoomView, action: str, argument: str = "") -> str:
         return pack_room_callback(view.room_id, view.revision, action, argument)
 
     @staticmethod
-    def _members_text(
-        members: tuple[MemberView, ...] | list[MemberView], *, reveal_roles: bool
-    ) -> str:
+    def _member_lines(members: tuple[MemberView, ...] | list[MemberView]) -> list[str]:
         if not members:
-            return "—"
-        values: list[str] = []
-        for member in members:
-            suffix = f" — {_role_label(member.role)}" if reveal_roles else ""
-            if member.status != "active" and not reveal_roles:
-                suffix += " (выбыл)"
-            values.append(f"{_name(member.display_name)}{suffix}")
-        return ", ".join(values)
+            return ["—"]
+        visible = members[:20]
+        lines = [f"• {_name(member.display_name)}" for member in visible]
+        if remaining := len(members) - len(visible):
+            lines.append(f"… и ещё {remaining}")
+        return lines
 
     @staticmethod
     def _page(
@@ -275,8 +290,10 @@ class RoomRenderer:
 
 def home_markup() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="🕵️ Создать комнату «Шпион»", callback_data="h:new")
+    builder.button(text="■ Создать комнату «Шпион»", callback_data="h:new:spy")
+    builder.button(text="🎩 Создать комнату «Шляпа»", callback_data="h:new:hat")
     builder.button(text="🔑 Войти по коду", callback_data="h:join")
+    builder.button(text="🎮 Активные комнаты", callback_data="h:rooms")
     builder.adjust(1)
     return builder.as_markup()
 

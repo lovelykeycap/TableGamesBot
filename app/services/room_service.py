@@ -4,7 +4,7 @@ import secrets
 from datetime import datetime, timezone
 from random import SystemRandom
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, AsyncSessionTransaction
 
 from app.domain.errors import DomainError
@@ -18,11 +18,20 @@ from app.domain.games.spy import (
     resolve_vote,
 )
 from app.services.locks import RoomLocks
-from app.services.views import MemberView, RoomView, SpyGameView, ThemeOption, VoteView
+from app.services.views import (
+    MemberView,
+    OpenRoomSummary,
+    RoomView,
+    SpyGameView,
+    ThemeOption,
+    VoteOutcome,
+    VoteView,
+)
 from app.storage.database import Database
 from app.storage.models import (
     CatalogLocation,
     CatalogTheme,
+    HatGame,
     Room,
     RoomMember,
     SpyGame,
@@ -78,6 +87,23 @@ class RoomService:
             session.add(room)
             await session.flush()
             session.add(RoomMember(room_id=room.id, user_id=host_user_id, status="active"))
+            return room.id
+
+    async def create_hat_room(self, host_user_id: int) -> int:
+        async with self._database.session() as session, session.begin():
+            room = Room(
+                game_type="hat",
+                status="lobby",
+                join_code=await self._new_join_code(session),
+                join_token=secrets.token_urlsafe(18),
+                host_user_id=host_user_id,
+                is_join_open=True,
+                settings={},
+            )
+            session.add(room)
+            await session.flush()
+            session.add(RoomMember(room_id=room.id, user_id=host_user_id, status="active"))
+            session.add(HatGame(room_id=room.id))
             return room.id
 
     async def join_by_token(self, token: str, user_id: int) -> int:
@@ -280,14 +306,20 @@ class RoomService:
             if target.id == actor.id:
                 raise DomainError("Нельзя выдвинуть на изгнание самого себя.")
             eligible = [member.id for member in await self._active_members(session, room.id)]
-            session.add(
-                Vote(
-                    room_id=room.id,
-                    kind=VOTE_EXILE,
-                    subject_member_id=target.id,
-                    eligible_member_ids=eligible,
-                    status="open",
-                )
+            vote = Vote(
+                room_id=room.id,
+                kind=VOTE_EXILE,
+                subject_member_id=target.id,
+                eligible_member_ids=eligible,
+                status="open",
+            )
+            session.add(vote)
+            await session.flush()
+            session.add_all(
+                [
+                    VoteChoice(vote_id=vote.id, member_id=actor.id, choice=True),
+                    VoteChoice(vote_id=vote.id, member_id=target.id, choice=False),
+                ]
             )
             self._bump(room)
 
@@ -311,7 +343,9 @@ class RoomService:
             )
             self._bump(room)
 
-    async def cast_vote(self, room_id: int, actor_user_id: int, vote_id: int, choice: bool) -> None:
+    async def cast_vote(
+        self, room_id: int, actor_user_id: int, vote_id: int, choice: bool
+    ) -> VoteOutcome | None:
         async with self._room_transaction(room_id) as (session, room):
             actor = await self._require_active_playing_member(session, room, actor_user_id)
             vote = await session.get(Vote, vote_id)
@@ -332,8 +366,9 @@ class RoomService:
                 raise DomainError("Ваш голос уже учтён.")
             session.add(VoteChoice(vote_id=vote.id, member_id=actor.id, choice=choice))
             await session.flush()
-            await self._resolve_open_vote_if_ready(session, room, vote)
+            outcome = await self._resolve_open_vote_if_ready(session, room, vote)
             self._bump(room)
+            return outcome
 
     async def emergency_cancel(self, room_id: int, actor_user_id: int) -> None:
         async with self._room_transaction(room_id) as (session, room):
@@ -441,6 +476,67 @@ class RoomService:
                     )
                 )
             )
+
+    async def room_game_type(self, room_id: int) -> str:
+        async with self._database.session() as session:
+            game_type = await session.scalar(select(Room.game_type).where(Room.id == room_id))
+            if game_type is None:
+                raise DomainError("Комната не найдена.")
+            return game_type
+
+    async def playing_room_for_user(self, user_id: int) -> int | None:
+        """Return an unfinished party in which the user still participates or spectates."""
+        async with self._database.session() as session:
+            return await session.scalar(
+                select(Room.id)
+                .join(RoomMember, RoomMember.room_id == Room.id)
+                .outerjoin(HatGame, HatGame.room_id == Room.id)
+                .where(
+                    RoomMember.user_id == user_id,
+                    RoomMember.status.in_(("active", "exiled", "left")),
+                    or_(
+                        Room.status == "playing",
+                        and_(
+                            Room.game_type == "hat",
+                            HatGame.phase.in_(
+                                (
+                                    "collecting",
+                                    "round_break",
+                                    "ready",
+                                    "countdown",
+                                    "turn",
+                                    "appeal",
+                                    "final_break",
+                                )
+                            ),
+                        ),
+                    ),
+                )
+                .order_by(Room.id)
+                .limit(1)
+            )
+
+    async def open_rooms_for_user(self, user_id: int) -> list[OpenRoomSummary]:
+        async with self._database.session() as session:
+            rows = await session.execute(
+                select(Room.id, Room.game_type, Room.status, Room.join_code)
+                .join(RoomMember, RoomMember.room_id == Room.id)
+                .where(
+                    RoomMember.user_id == user_id,
+                    RoomMember.status.in_(("active", "exiled", "left")),
+                    Room.status.in_(("lobby", "playing")),
+                )
+                .order_by(Room.created_at.desc(), Room.id.desc())
+            )
+            return [
+                OpenRoomSummary(
+                    id=room_id,
+                    game_type=game_type,
+                    status=status,
+                    join_code=join_code,
+                )
+                for room_id, game_type, status, join_code in rows
+            ]
 
     async def _new_join_code(self, session: AsyncSession) -> str:
         alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
@@ -576,7 +672,7 @@ class RoomService:
 
     async def _resolve_open_vote_if_ready(
         self, session: AsyncSession, room: Room, vote: Vote
-    ) -> None:
+    ) -> VoteOutcome | None:
         eligible = await self._current_eligible_members(session, room.id, vote.eligible_member_ids)
         vote.eligible_member_ids = [member.id for member in eligible]
         choices = list(
@@ -589,7 +685,17 @@ class RoomService:
             eligible_count=len(eligible_ids), yes_count=yes_count, cast_count=cast_count
         )
         if not resolution.is_resolved:
-            return
+            return None
+        subject = await session.get(RoomMember, vote.subject_member_id)
+        if subject is None or subject.room_id != room.id:
+            raise RuntimeError("Vote subject is missing from its room")
+        subject_user = await session.get(User, subject.user_id)
+        outcome = VoteOutcome(
+            kind=vote.kind,
+            subject_name=subject_user.display_name if subject_user else str(subject.user_id),
+            subject_role=subject.role,
+            accepted=bool(resolution.accepted),
+        )
         vote.status = "closed"
         vote.closed_at = datetime.now(timezone.utc)
         if vote.kind == VOTE_EXILE:
@@ -604,6 +710,7 @@ class RoomService:
                 await self._maybe_finish_civilians(session, room)
         else:
             raise RuntimeError(f"Unknown vote kind: {vote.kind}")
+        return outcome
 
     async def _exile_member(self, session: AsyncSession, room: Room, member_id: int) -> None:
         member = await session.get(RoomMember, member_id)
@@ -674,3 +781,7 @@ class RoomService:
 
     def _room_transaction(self, room_id: int) -> _RoomTransaction:
         return self._RoomTransaction(self, room_id)
+
+    def room_transaction(self, room_id: int) -> _RoomTransaction:
+        """Shared room lock and transaction for game-specific services."""
+        return self._room_transaction(room_id)
